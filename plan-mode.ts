@@ -99,13 +99,28 @@ export interface PlanModeConfig {
 	restoreThinkingLevel?: boolean;
 }
 
-function readConfig(file: string): Partial<PlanModeConfig> {
+function readJsonObject(file: string): Record<string, unknown> {
 	if (!existsSync(file)) return {};
 	try {
-		return JSON.parse(readFileSync(file, "utf8")) as Partial<PlanModeConfig>;
+		const parsed = JSON.parse(readFileSync(file, "utf8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? parsed as Record<string, unknown>
+			: {};
 	} catch {
 		return {};
 	}
+}
+
+function readConfig(file: string): Partial<PlanModeConfig> {
+	return readJsonObject(file) as Partial<PlanModeConfig>;
+}
+
+function readPlanModeSettingsConfig(file: string): Partial<PlanModeConfig> {
+	const settings = readJsonObject(file);
+	const planMode = settings.planMode;
+	return planMode && typeof planMode === "object" && !Array.isArray(planMode)
+		? planMode as Partial<PlanModeConfig>
+		: {};
 }
 
 function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
@@ -132,9 +147,14 @@ function mergeConfig(base: PlanModeConfig, override: PlanModeConfig): PlanModeCo
 }
 
 export function loadPlanModeConfig(cwd: string, home = os.homedir()): PlanModeConfig {
-	const globalConfig = normalizeConfig(readConfig(path.join(home, ".pi", "agent", "plan-mode.json")));
-	const projectConfig = normalizeConfig(readConfig(path.join(cwd, ".pi", "plan-mode.json")));
-	return mergeConfig(globalConfig, projectConfig);
+	const globalSettingsConfig = normalizeConfig(readPlanModeSettingsConfig(path.join(home, ".pi", "agent", "settings.json")));
+	const globalLegacyConfig = normalizeConfig(readConfig(path.join(home, ".pi", "agent", "plan-mode.json")));
+	const projectSettingsConfig = normalizeConfig(readPlanModeSettingsConfig(path.join(cwd, ".pi", "settings.json")));
+	const projectLegacyConfig = normalizeConfig(readConfig(path.join(cwd, ".pi", "plan-mode.json")));
+	return [globalLegacyConfig, projectSettingsConfig, projectLegacyConfig].reduce(
+		(config, override) => mergeConfig(config, override),
+		globalSettingsConfig,
+	);
 }
 
 export function getConfiguredThinkingLevel(config: PlanModeConfig): ThinkingLevel | undefined {
@@ -251,6 +271,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
 	let pendingNewConversationPlan: string | undefined;
 	let prePlanThinkingLevel: ThinkingLevel | undefined;
+	let lastCommandContext: ExtensionCommandContext | undefined;
 
 	pi.registerTool({
 		name: "save_plan",
@@ -325,7 +346,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("plan", {
 		description: "Toggle plan mode, or start planning with /plan <request>",
-		handler: async (args, ctx) => {
+		handler: async (args, ctx: ExtensionCommandContext) => {
+			lastCommandContext = ctx;
 			if (!hasPlanRequest(args)) {
 				setPlanMode(!planModeEnabled, ctx);
 				return;
@@ -343,21 +365,34 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	async function implementPlanInNewConversation(plan: string, ctx: ExtensionCommandContext): Promise<boolean> {
+		const newSession = (ctx as any).newSession;
+		if (typeof newSession !== "function") return false;
+
+		setPlanMode(false, ctx, false);
+		const sessionOptions: any = {
+			withSession: async (newCtx: any) => {
+				await newCtx.sendUserMessage(formatImplementationPrompt(plan));
+			},
+		};
+		const parentSession = ctx.sessionManager?.getSessionFile?.();
+		if (parentSession) sessionOptions.parentSession = parentSession;
+		const result = await newSession.call(ctx, sessionOptions);
+		return !result?.cancelled;
+	}
+
 	pi.registerCommand("plan-implement-new", {
 		description: "Implement the most recently captured plan-mode plan in a new conversation",
 		handler: async (_args, ctx: ExtensionCommandContext) => {
+			lastCommandContext = ctx;
 			if (!pendingNewConversationPlan) {
 				ctx.ui.notify("No pending plan to implement in a new conversation.", "warning");
 				return;
 			}
 			const plan = pendingNewConversationPlan;
 			pendingNewConversationPlan = undefined;
-			setPlanMode(false, ctx, false);
-			await (ctx as any).newSession({
-				withSession: async (newCtx: any) => {
-					await newCtx.sendUserMessage(formatImplementationPrompt(plan));
-				},
-			});
+			const started = await implementPlanInNewConversation(plan, ctx);
+			if (!started) pendingNewConversationPlan = plan;
 		},
 	});
 
@@ -378,7 +413,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			await (pi as any).sendUserMessage(formatImplementationPrompt(plan));
 		} else if (choice === "Implement in a new conversation") {
 			pendingNewConversationPlan = plan;
-			ctx.ui.notify("Run /plan-implement-new to start a new conversation with this plan.", "info");
+			const commandCtx = lastCommandContext;
+			if (!commandCtx) {
+				ctx.ui.notify("Run /plan-implement-new to start a new conversation with this plan.", "info");
+			} else {
+				ctx.ui.notify("Starting a new conversation with this plan...", "info");
+				setTimeout(() => {
+					void (async () => {
+						const pendingPlan = pendingNewConversationPlan;
+						if (!pendingPlan) return;
+						pendingNewConversationPlan = undefined;
+						const started = await implementPlanInNewConversation(pendingPlan, commandCtx);
+						if (!started) pendingNewConversationPlan = pendingPlan;
+					})();
+				}, 0);
+			}
 		} else if (choice === "Store plan") {
 			const storageRoot = getPlanStorageRoot(ctx);
 			const target = await resolvePlanPath(storageRoot);

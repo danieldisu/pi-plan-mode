@@ -28,23 +28,25 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 |---|---|
 | `/plan` | Toggle plan mode on/off |
 | `/plan <request>` | Enable/keep plan mode active and send `<request>` to the agent as a planning-only task |
-| `/plan-implement-new` | Start a new conversation seeded with the most recently captured plan |
+| `/plan-implement-new` | Retry/fallback command to start a new conversation seeded with the most recently captured plan |
 
 ## Post-Plan Actions
 
 When an assistant turn ends in plan mode and UI is available, pi-plan-mode captures the latest assistant plan and prompts for the next action:
 
 - **Exit plan mode and implement here**: disables plan mode, restores normal tools, and sends the captured plan back as an implementation request in the current conversation.
-- **Implement in a new conversation**: stores the captured plan as pending state. Run `/plan-implement-new` to create a new session and seed it with the implementation prompt.
+- **Implement in a new conversation**: starts a new session automatically when a command context is available and seeds it with the implementation prompt. If automatic startup is unavailable, run `/plan-implement-new` to retry with the captured plan.
 - **Store plan**: writes the captured plan to a timestamped Markdown file under the configured plan storage directory.
 - **Stay in plan mode**: leaves plan mode active.
 
 ## Configuration
 
-Configuration is read from:
+Configuration is read from, in precedence order from lowest to highest:
 
-1. `~/.pi/agent/plan-mode.json`
-2. `<cwd>/.pi/plan-mode.json` (project values override global values)
+1. `~/.pi/agent/settings.json` (`planMode` object)
+2. `~/.pi/agent/plan-mode.json` (legacy)
+3. `<cwd>/.pi/settings.json` (`planMode` object)
+4. `<cwd>/.pi/plan-mode.json` (legacy project values override all others)
 
 Plan storage is resolved in this order:
 
@@ -54,11 +56,34 @@ Plan storage is resolved in this order:
 
 Thinking configuration:
 
+- No configured thinking value means `/plan` preserves the current thinking level.
 - `defaultThinkingLevel`: thinking level to apply while plan mode is active (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
 - `defaultThinkingEffort`: alias for `defaultThinkingLevel`
 - `restoreThinkingLevel`: restore the previous thinking level on exit; defaults to `true`
 
-Example config:
+Pi settings example (`~/.pi/agent/settings.json` or `<cwd>/.pi/settings.json`):
+
+```json
+{
+  "planMode": {
+    "defaultPlanStorage": "tmp",
+    "defaultThinkingLevel": "high",
+    "restoreThinkingLevel": true
+  }
+}
+```
+
+Alias example:
+
+```json
+{
+  "planMode": {
+    "defaultThinkingEffort": "high"
+  }
+}
+```
+
+Legacy `plan-mode.json` files are still supported:
 
 ```json
 {

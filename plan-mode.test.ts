@@ -78,6 +78,18 @@ describe("plan command", () => {
 		expect(pi.sendUserMessage).not.toHaveBeenCalled();
 	});
 
+	it("preserves thinking level when no thinking config is set", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			const { pi, handler } = setupCommand(cwd);
+			await handler("", { cwd, ui: { notify: vi.fn(), setStatus: vi.fn(), theme: { fg: vi.fn((_name, text) => text) } } });
+
+			expect(pi.setThinkingLevel).not.toHaveBeenCalled();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("enables plan mode and sends a planning request with args", async () => {
 		const { pi, ctx, handler } = setupCommand();
 
@@ -223,6 +235,89 @@ describe("plan-mode whitelist", () => {
 	});
 });
 
+describe("post-plan actions", () => {
+	function setupAgentEnd(choice: string) {
+		let agentEnd: ((event: any, ctx: any) => Promise<void>) | undefined;
+		let sessionStart: ((event: any, ctx: any) => Promise<void>) | undefined;
+		const pi = {
+			registerTool: vi.fn(),
+			registerCommand: vi.fn(),
+			on: vi.fn((name, handler) => {
+				if (name === "agent_end") agentEnd = handler;
+				if (name === "session_start") sessionStart = handler;
+			}),
+			appendEntry: vi.fn(),
+			sendUserMessage: vi.fn(),
+			getThinkingLevel: vi.fn(() => "medium"),
+			setThinkingLevel: vi.fn(),
+			getAllTools: vi.fn(() => []),
+			setActiveTools: vi.fn(),
+		} as any;
+		const eventCtx = {
+			cwd: process.cwd(),
+			hasUI: true,
+			sessionManager: { getEntries: vi.fn(() => []) },
+			ui: {
+				select: vi.fn(async () => choice),
+				notify: vi.fn(),
+				setStatus: vi.fn(),
+				theme: { fg: vi.fn((_name, text) => text) },
+			},
+		} as any;
+		const newSessionCtx = { sendUserMessage: vi.fn() };
+		const commandCtx = {
+			...eventCtx,
+			sessionManager: { getSessionFile: vi.fn(() => "/tmp/parent-session.jsonl") },
+			newSession: vi.fn(async ({ withSession }) => {
+				await withSession(newSessionCtx);
+				return { cancelled: false };
+			}),
+		} as any;
+
+		planModeExtension(pi);
+		const planHandler = pi.registerCommand.mock.calls.find(([name]: [string]) => name === "plan")?.[1].handler;
+		if (!agentEnd || !planHandler || !sessionStart) throw new Error("handlers were not registered");
+		return { pi, eventCtx, commandCtx, newSessionCtx, agentEnd, planHandler, sessionStart };
+	}
+
+	it("starts a new conversation from the saved command context when selected from the plan completion menu", async () => {
+		vi.useFakeTimers();
+		try {
+			const { eventCtx, commandCtx, newSessionCtx, agentEnd, planHandler } = setupAgentEnd("Implement in a new conversation");
+			await planHandler("", commandCtx);
+
+			await agentEnd({ messages: [{ role: "assistant", content: "## Plan\n- Do thing" }] }, eventCtx);
+			await vi.runAllTimersAsync();
+
+			expect(commandCtx.newSession).toHaveBeenCalledOnce();
+			expect(commandCtx.newSession).toHaveBeenCalledWith(expect.objectContaining({ parentSession: "/tmp/parent-session.jsonl" }));
+			expect(newSessionCtx.sendUserMessage).toHaveBeenCalledWith("Implement this plan:\n\n- Do thing");
+			expect(eventCtx.ui.notify).not.toHaveBeenCalledWith(
+				"Run /plan-implement-new to start a new conversation with this plan.",
+				"info",
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("falls back to /plan-implement-new when no command context is available", async () => {
+		const { eventCtx, commandCtx, agentEnd, sessionStart } = setupAgentEnd("Implement in a new conversation");
+		eventCtx.sessionManager.getEntries.mockReturnValue([
+			{ type: "custom", customType: "plan-mode", data: { active: true } },
+		]);
+		await sessionStart({}, eventCtx);
+
+		await agentEnd({ messages: [{ role: "assistant", content: "## Plan\n- Do thing" }] }, eventCtx);
+
+		expect(commandCtx.newSession).not.toHaveBeenCalled();
+		expect(eventCtx.ui.notify).toHaveBeenCalledWith(
+			"Run /plan-implement-new to start a new conversation with this plan.",
+			"info",
+		);
+	});
+});
+
 describe("plan extraction", () => {
 	it("extracts the latest assistant plan from a Plan heading", () => {
 		const plan = extractLatestPlan([
@@ -260,12 +355,54 @@ describe("plan mode config", () => {
 		}
 	});
 
+	it("loads global Pi settings planMode config", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(home, ".pi", "agent"), { recursive: true });
+			await writeFile(path.join(home, ".pi", "agent", "settings.json"), JSON.stringify({
+				planMode: { defaultThinkingLevel: "medium", restoreThinkingLevel: false },
+			}));
+
+			const config = loadPlanModeConfig(cwd, home);
+			expect(config.defaultThinkingLevel).toBe("medium");
+			expect(config.restoreThinkingLevel).toBe(false);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("lets project Pi settings override global Pi settings", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(home, ".pi", "agent"), { recursive: true });
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(home, ".pi", "agent", "settings.json"), JSON.stringify({
+				planMode: { defaultThinkingLevel: "low", restoreThinkingLevel: true },
+			}));
+			await writeFile(path.join(cwd, ".pi", "settings.json"), JSON.stringify({
+				planMode: { defaultThinkingLevel: "high" },
+			}));
+
+			const config = loadPlanModeConfig(cwd, home);
+			expect(config.defaultThinkingLevel).toBe("high");
+			expect(config.restoreThinkingLevel).toBe(true);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("ignores invalid thinking levels", async () => {
 		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
 		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
 		try {
 			await mkdir(path.join(cwd, ".pi"), { recursive: true });
-			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "extreme" }));
+			await writeFile(path.join(cwd, ".pi", "settings.json"), JSON.stringify({
+				planMode: { defaultThinkingLevel: "extreme" },
+			}));
 			const config = loadPlanModeConfig(cwd, home);
 			expect(config.defaultThinkingLevel).toBeUndefined();
 			expect(getConfiguredThinkingLevel(config)).toBeUndefined();
@@ -280,7 +417,28 @@ describe("plan mode config", () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
 		try {
 			await mkdir(path.join(cwd, ".pi"), { recursive: true });
-			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingEffort: "xhigh" }));
+			await writeFile(path.join(cwd, ".pi", "settings.json"), JSON.stringify({
+				planMode: { defaultThinkingEffort: "xhigh" },
+			}));
+			const config = loadPlanModeConfig(cwd, home);
+			expect(getConfiguredThinkingLevel(config)).toBe("xhigh");
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps project legacy plan-mode config highest precedence", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(home, ".pi", "agent"), { recursive: true });
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(home, ".pi", "agent", "settings.json"), JSON.stringify({ planMode: { defaultThinkingLevel: "low" } }));
+			await writeFile(path.join(home, ".pi", "agent", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "medium" }));
+			await writeFile(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ planMode: { defaultThinkingLevel: "high" } }));
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "xhigh" }));
+
 			const config = loadPlanModeConfig(cwd, home);
 			expect(getConfiguredThinkingLevel(config)).toBe("xhigh");
 		} finally {
