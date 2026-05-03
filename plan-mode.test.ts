@@ -11,9 +11,11 @@ import path from "node:path";
 import planModeExtension, {
 	extractLatestPlan,
 	formatPlanRequest,
+	getConfiguredThinkingLevel,
 	getPlanStorageRoot,
 	hasPlanRequest,
 	isWhitelisted,
+	loadPlanModeConfig,
 	resolvePlanPath,
 	timestampedPlanFilename,
 } from "./plan-mode.js";
@@ -37,7 +39,7 @@ describe("plan request helpers", () => {
 });
 
 describe("plan command", () => {
-	function setupCommand() {
+	function setupCommand(cwd = process.cwd()) {
 		let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
 		const pi = {
 			registerTool: vi.fn(),
@@ -47,8 +49,13 @@ describe("plan command", () => {
 			on: vi.fn(),
 			appendEntry: vi.fn(),
 			sendUserMessage: vi.fn(),
+			getThinkingLevel: vi.fn(() => "medium"),
+			setThinkingLevel: vi.fn(),
+			getAllTools: vi.fn(() => []),
+			setActiveTools: vi.fn(),
 		} as any;
 		const ctx = {
+			cwd,
 			ui: {
 				notify: vi.fn(),
 				setStatus: vi.fn(),
@@ -91,6 +98,23 @@ describe("plan command", () => {
 		expect(ctx.ui.notify).toHaveBeenCalledWith("i️ Plan mode already active - starting plan", "info");
 		expect(pi.appendEntry).toHaveBeenCalledWith("plan-mode", expect.objectContaining({ active: true }));
 		expect(pi.sendUserMessage).toHaveBeenCalledOnce();
+	});
+
+	it("applies configured thinking on enable and restores previous thinking on disable", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "high" }));
+			const { pi, handler } = setupCommand(cwd);
+
+			await handler("", { cwd, ui: { notify: vi.fn(), setStatus: vi.fn(), theme: { fg: vi.fn((_name, text) => text) } } });
+			await handler("", { cwd, ui: { notify: vi.fn(), setStatus: vi.fn(), theme: { fg: vi.fn((_name, text) => text) } } });
+
+			expect(pi.setThinkingLevel).toHaveBeenNthCalledWith(1, "high");
+			expect(pi.setThinkingLevel).toHaveBeenNthCalledWith(2, "medium");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -210,6 +234,59 @@ describe("plan extraction", () => {
 
 	it("falls back to the full latest assistant text", () => {
 		expect(extractLatestPlan([{ role: "assistant", content: "No heading here" }])).toBe("No heading here");
+	});
+});
+
+describe("plan mode config", () => {
+	it("loads global config and lets project config override it", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(home, ".pi", "agent"), { recursive: true });
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(home, ".pi", "agent", "plan-mode.json"), JSON.stringify({
+				defaultThinkingLevel: "low",
+				restoreThinkingLevel: true,
+			}));
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "high" }));
+
+			const config = loadPlanModeConfig(cwd, home);
+			expect(config.defaultThinkingLevel).toBe("high");
+			expect(config.restoreThinkingLevel).toBe(true);
+			expect(getConfiguredThinkingLevel(config)).toBe("high");
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores invalid thinking levels", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingLevel: "extreme" }));
+			const config = loadPlanModeConfig(cwd, home);
+			expect(config.defaultThinkingLevel).toBeUndefined();
+			expect(getConfiguredThinkingLevel(config)).toBeUndefined();
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("supports defaultThinkingEffort as an alias", async () => {
+		const home = await mkdtemp(path.join(tmpdir(), "pi-plan-home-"));
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultThinkingEffort: "xhigh" }));
+			const config = loadPlanModeConfig(cwd, home);
+			expect(getConfiguredThinkingLevel(config)).toBe("xhigh");
+		} finally {
+			await rm(home, { recursive: true, force: true });
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 });
 

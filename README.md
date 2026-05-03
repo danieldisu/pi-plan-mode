@@ -39,24 +39,36 @@ When an assistant turn ends in plan mode and UI is available, pi-plan-mode captu
 - **Store plan**: writes the captured plan to a timestamped Markdown file under the configured plan storage directory.
 - **Stay in plan mode**: leaves plan mode active.
 
-## Plan Storage Configuration
+## Configuration
+
+Configuration is read from:
+
+1. `~/.pi/agent/plan-mode.json`
+2. `<cwd>/.pi/plan-mode.json` (project values override global values)
 
 Plan storage is resolved in this order:
 
 1. `DEFAULT_PLAN_STORAGE` environment variable
-2. `defaultPlanStorage` in `<cwd>/.pi/plan-mode.json`
-3. `defaultPlanStorage` in `~/.pi/agent/plan-mode.json`
-4. `<cwd>/tmp`
+2. `defaultPlanStorage` in config
+3. `<cwd>/tmp`
+
+Thinking configuration:
+
+- `defaultThinkingLevel`: thinking level to apply while plan mode is active (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
+- `defaultThinkingEffort`: alias for `defaultThinkingLevel`
+- `restoreThinkingLevel`: restore the previous thinking level on exit; defaults to `true`
 
 Example config:
 
 ```json
 {
-  "defaultPlanStorage": "tmp"
+  "defaultPlanStorage": "tmp",
+  "defaultThinkingLevel": "high",
+  "restoreThinkingLevel": true
 }
 ```
 
-Relative paths resolve against the current working directory.
+Relative storage paths resolve against the current working directory.
 
 ## Safety & Restrictions
 

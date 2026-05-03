@@ -88,25 +88,63 @@ export function isWhitelisted(command: string): boolean {
 	return SAFE_COMMAND_PATTERNS.some((p) => p.test(trimmed));
 }
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+const VALID_THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
 export interface PlanModeConfig {
 	defaultPlanStorage?: string;
+	defaultThinkingLevel?: ThinkingLevel;
+	defaultThinkingEffort?: ThinkingLevel;
+	restoreThinkingLevel?: boolean;
 }
 
-function readConfig(file: string): PlanModeConfig {
+function readConfig(file: string): Partial<PlanModeConfig> {
 	if (!existsSync(file)) return {};
 	try {
-		return JSON.parse(readFileSync(file, "utf8")) as PlanModeConfig;
+		return JSON.parse(readFileSync(file, "utf8")) as Partial<PlanModeConfig>;
 	} catch {
 		return {};
 	}
 }
 
+function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	return typeof value === "string" && VALID_THINKING_LEVELS.has(value as ThinkingLevel)
+		? value as ThinkingLevel
+		: undefined;
+}
+
+function normalizeConfig(config: Partial<PlanModeConfig>): PlanModeConfig {
+	return {
+		...config,
+		defaultThinkingLevel: normalizeThinkingLevel(config.defaultThinkingLevel),
+		defaultThinkingEffort: normalizeThinkingLevel(config.defaultThinkingEffort),
+		restoreThinkingLevel: typeof config.restoreThinkingLevel === "boolean" ? config.restoreThinkingLevel : undefined,
+	};
+}
+
+function mergeConfig(base: PlanModeConfig, override: PlanModeConfig): PlanModeConfig {
+	const merged: PlanModeConfig = { ...base };
+	for (const [key, value] of Object.entries(override)) {
+		if (value !== undefined) (merged as any)[key] = value;
+	}
+	return merged;
+}
+
+export function loadPlanModeConfig(cwd: string, home = os.homedir()): PlanModeConfig {
+	const globalConfig = normalizeConfig(readConfig(path.join(home, ".pi", "agent", "plan-mode.json")));
+	const projectConfig = normalizeConfig(readConfig(path.join(cwd, ".pi", "plan-mode.json")));
+	return mergeConfig(globalConfig, projectConfig);
+}
+
+export function getConfiguredThinkingLevel(config: PlanModeConfig): ThinkingLevel | undefined {
+	return config.defaultThinkingLevel || config.defaultThinkingEffort;
+}
+
 export function getPlanStorageRoot(ctx: Pick<ExtensionContext, "cwd">): string {
-	const globalConfig = readConfig(path.join(os.homedir(), ".pi", "agent", "plan-mode.json"));
-	const projectConfig = readConfig(path.join(ctx.cwd, ".pi", "plan-mode.json"));
+	const config = loadPlanModeConfig(ctx.cwd);
 	const configured = process.env.DEFAULT_PLAN_STORAGE
-		|| projectConfig.defaultPlanStorage
-		|| globalConfig.defaultPlanStorage
+		|| config.defaultPlanStorage
 		|| path.join(ctx.cwd, "tmp");
 	return path.resolve(ctx.cwd, configured);
 }
@@ -212,6 +250,7 @@ export function formatImplementationPrompt(plan: string): string {
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
 	let pendingNewConversationPlan: string | undefined;
+	let prePlanThinkingLevel: ThinkingLevel | undefined;
 
 	pi.registerTool({
 		name: "save_plan",
@@ -243,6 +282,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	function persistState(ctx: ExtensionContext): void {
 		pi.appendEntry("plan-mode", {
 			active: planModeEnabled,
+			prePlanThinkingLevel,
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -253,6 +293,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function setPlanMode(enabled: boolean, ctx: ExtensionContext, notify = true): void {
+		const config = loadPlanModeConfig(ctx.cwd);
+		const configuredThinkingLevel = getConfiguredThinkingLevel(config);
+
+		if (enabled && !planModeEnabled) {
+			prePlanThinkingLevel = pi.getThinkingLevel?.();
+			if (configuredThinkingLevel) pi.setThinkingLevel?.(configuredThinkingLevel as any);
+		}
+
+		if (!enabled && planModeEnabled) {
+			if (config.restoreThinkingLevel !== false && prePlanThinkingLevel) {
+				pi.setThinkingLevel?.(prePlanThinkingLevel as any);
+			}
+			prePlanThinkingLevel = undefined;
+		}
+
 		planModeEnabled = enabled;
 		if (!planModeEnabled) restoreNormalTools();
 
@@ -375,6 +430,9 @@ Help the user plan what needs to be done:
 
 		if (lastEntry && "data" in lastEntry && (lastEntry as any).data?.active === true) {
 			planModeEnabled = true;
+			prePlanThinkingLevel = normalizeThinkingLevel((lastEntry as any).data?.prePlanThinkingLevel);
+			const configuredThinkingLevel = getConfiguredThinkingLevel(loadPlanModeConfig(ctx.cwd));
+			if (configuredThinkingLevel) pi.setThinkingLevel?.(configuredThinkingLevel as any);
 			updateStatus(ctx);
 			ctx.ui.notify("i️ Plan mode restored", "info");
 		}
