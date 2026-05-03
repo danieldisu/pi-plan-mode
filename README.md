@@ -5,6 +5,7 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 ## Features
 
 - **Simple toggle**: `/plan` enables/disables plan mode
+- **Prompted planning**: `/plan <request>` enters plan mode and starts a planning turn immediately
 - **Blocks write/edit tools**: When active, `write` and `edit` tools are completely blocked
 - **Controlled plan saving**: `save_plan` is the only write-capable tool in plan mode and only stores Markdown under the plan storage directory
 - **Smart bash filtering**: Safe commands allowed, mutating commands reviewed by AI
@@ -16,14 +17,16 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 ## Quick Start
 
 1. Enable plan mode: `/plan`
-2. Explore the codebase with read-only tools
-3. Disable plan mode: `/plan` again
+2. Or enter plan mode and start planning immediately: `/plan how to update this extension`
+3. Explore the codebase with read-only tools
+4. Disable plan mode: `/plan` again
 
 ## Command Reference
 
 | Command | What it does |
 |---|---|
 | `/plan` | Toggle plan mode on/off |
+| `/plan <request>` | Enable/keep plan mode active and send `<request>` to the agent as a planning-only task |
 
 ## Safety & Restrictions
 

@@ -4,11 +4,87 @@
  * These tests document the current bugs where safe commands are incorrectly blocked.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { isWhitelisted, resolvePlanPath } from "./plan-mode.js";
+import planModeExtension, { formatPlanRequest, hasPlanRequest, isWhitelisted, resolvePlanPath } from "./plan-mode.js";
+
+describe("plan request helpers", () => {
+	it("detects non-whitespace plan requests", () => {
+		expect(hasPlanRequest("update this extension")).toBe(true);
+		expect(hasPlanRequest("  update this extension  ")).toBe(true);
+		expect(hasPlanRequest("   ")).toBe(false);
+		expect(hasPlanRequest()).toBe(false);
+	});
+
+	it("formats a planning-only user message with the original request", () => {
+		const message = formatPlanRequest("  how to update this extension  ");
+
+		expect(message).toContain("Plan this request without implementing it yet:");
+		expect(message).toContain("how to update this extension");
+		expect(message).toContain("Do not implement changes until plan mode is exited.");
+		expect(message).not.toContain("/plan");
+	});
+});
+
+describe("plan command", () => {
+	function setupCommand() {
+		let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
+		const pi = {
+			registerTool: vi.fn(),
+			registerCommand: vi.fn((_name, config) => {
+				handler = config.handler;
+			}),
+			on: vi.fn(),
+			appendEntry: vi.fn(),
+			sendUserMessage: vi.fn(),
+		} as any;
+		const ctx = {
+			ui: {
+				notify: vi.fn(),
+				setStatus: vi.fn(),
+				theme: { fg: vi.fn((_name, text) => text) },
+			},
+		} as any;
+
+		planModeExtension(pi);
+		if (!handler) throw new Error("plan command was not registered");
+		return { pi, ctx, handler };
+	}
+
+	it("toggles only and does not send a user message without args", async () => {
+		const { pi, ctx, handler } = setupCommand();
+
+		await handler("   ", ctx);
+
+		expect(ctx.ui.notify).toHaveBeenCalledWith("✅ Plan mode enabled - writes blocked", "info");
+		expect(pi.appendEntry).toHaveBeenCalledWith("plan-mode", expect.objectContaining({ active: true }));
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+	});
+
+	it("enables plan mode and sends a planning request with args", async () => {
+		const { pi, ctx, handler } = setupCommand();
+
+		await handler("something to plan", ctx);
+
+		expect(pi.appendEntry).toHaveBeenCalledWith("plan-mode", expect.objectContaining({ active: true }));
+		expect(pi.sendUserMessage).toHaveBeenCalledOnce();
+		expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("something to plan"));
+	});
+
+	it("does not disable plan mode when already active and args are provided", async () => {
+		const { pi, ctx, handler } = setupCommand();
+		await handler("", ctx);
+		vi.clearAllMocks();
+
+		await handler("next plan", ctx);
+
+		expect(ctx.ui.notify).toHaveBeenCalledWith("i️ Plan mode already active - starting plan", "info");
+		expect(pi.appendEntry).toHaveBeenCalledWith("plan-mode", expect.objectContaining({ active: true }));
+		expect(pi.sendUserMessage).toHaveBeenCalledOnce();
+	});
+});
 
 describe("plan-mode whitelist", () => {
 	describe("commands without trailing space", () => {

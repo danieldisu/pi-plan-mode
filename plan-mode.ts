@@ -140,6 +140,19 @@ function getBashOverride(entries: any[], command: string): boolean {
 	return false;
 }
 
+export function hasPlanRequest(args = ""): boolean {
+	return args.trim().length > 0;
+}
+
+export function formatPlanRequest(args: string): string {
+	const request = args.trim();
+	return `Plan this request without implementing it yet:
+
+${request}
+
+Explore as needed, identify files to change, and produce a concrete implementation plan. Use save_plan if the plan should be stored. Do not implement changes until plan mode is exited.`;
+}
+
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
 
@@ -177,19 +190,38 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	pi.registerCommand("plan", {
-		description: "Toggle plan mode (blocks write/edit tools)",
-		handler: async (_args, ctx) => {
-			planModeEnabled = !planModeEnabled;
+	function setPlanMode(enabled: boolean, ctx: ExtensionContext, notify = true): void {
+		planModeEnabled = enabled;
 
+		if (notify) {
 			if (planModeEnabled) {
 				ctx.ui.notify("✅ Plan mode enabled - writes blocked", "info");
 			} else {
 				ctx.ui.notify("✅ Plan mode disabled - writes enabled", "info");
 			}
+		}
 
-			updateStatus(ctx);
-			persistState(ctx);
+		updateStatus(ctx);
+		persistState(ctx);
+	}
+
+	pi.registerCommand("plan", {
+		description: "Toggle plan mode, or start planning with /plan <request>",
+		handler: async (args, ctx) => {
+			if (!hasPlanRequest(args)) {
+				setPlanMode(!planModeEnabled, ctx);
+				return;
+			}
+
+			if (!planModeEnabled) {
+				setPlanMode(true, ctx);
+			} else {
+				ctx.ui.notify("i️ Plan mode already active - starting plan", "info");
+				updateStatus(ctx);
+				persistState(ctx);
+			}
+
+			await (pi as any).sendUserMessage(formatPlanRequest(args));
 		},
 	});
 
