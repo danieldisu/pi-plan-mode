@@ -5,7 +5,10 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { isWhitelisted } from "./plan-mode.js";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { isWhitelisted, resolvePlanPath } from "./plan-mode.js";
 
 describe("plan-mode whitelist", () => {
 	describe("commands without trailing space", () => {
@@ -95,5 +98,64 @@ describe("plan-mode whitelist", () => {
 			// This should be blocked - piping to rm is dangerous
 			expect(isWhitelisted("find . -name '*.log' | xargs rm")).toBe(false);
 		});
+
+		it("should block tee writes", () => {
+			expect(isWhitelisted("tee plan.md")).toBe(false);
+			expect(isWhitelisted("echo test | tee plan.md")).toBe(false);
+		});
+
+		it("should block heredocs", () => {
+			expect(isWhitelisted("cat <<EOF")).toBe(false);
+		});
+
+		it("should block runtime scripting writes", () => {
+			expect(isWhitelisted("python -c \"from pathlib import Path; Path('x').write_text('y')\"")).toBe(false);
+			expect(isWhitelisted("node -e \"require('fs').writeFileSync('x','y')\"")).toBe(false);
+		});
+	});
+});
+
+describe("save_plan path resolution", () => {
+	it("allows markdown files in the storage root", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "pi-plan-mode-"));
+		try {
+			const target = await resolvePlanPath(root, "plans/test.md");
+			expect(target).toBe(path.resolve(root, "plans/test.md"));
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("generates a markdown filename by default", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "pi-plan-mode-"));
+		try {
+			const target = await resolvePlanPath(root);
+			expect(path.dirname(target)).toBe(path.resolve(root));
+			expect(path.basename(target)).toMatch(/^plan-.*\.md$/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects traversal and non-markdown paths", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "pi-plan-mode-"));
+		try {
+			await expect(resolvePlanPath(root, "../escape.md")).rejects.toThrow(/traversal/);
+			await expect(resolvePlanPath(root, "plan.txt")).rejects.toThrow(/\.md/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects symlinks that escape the storage root", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "pi-plan-mode-"));
+		const outside = await mkdtemp(path.join(tmpdir(), "pi-plan-outside-"));
+		try {
+			await symlink(outside, path.join(root, "link"));
+			await expect(resolvePlanPath(root, "link/escape.md")).rejects.toThrow(/symlinks/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
 	});
 });

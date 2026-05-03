@@ -29,6 +29,9 @@
     "test": "vitest",
     "prepublishOnly": "npm run typecheck"
   },
+  "dependencies": {
+    "typebox": "^1.0.55"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "^0.63.0"

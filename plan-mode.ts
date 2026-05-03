@@ -7,6 +7,9 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { completeSimple } from "@mariozechner/pi-ai";
+import { Type } from "typebox";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
 export const SAFE_COMMAND_PATTERNS: RegExp[] = [
 	/^\s*cat\b/,
@@ -52,6 +55,7 @@ export const REDIRECT_PATTERN = />{1,2}/;
 
 // Patterns for unsafe pipe targets
 const UNSAFE_PIPE_PATTERNS: RegExp[] = [
+	/\|\s*tee\b/,
 	/\|\s*rm\b/,
 	/\|\s*xargs.*rm\b/,
 	/\|\s*sudo\b/,
@@ -63,6 +67,13 @@ const UNSAFE_PIPE_PATTERNS: RegExp[] = [
 	/\|\s*curl\b/,
 ];
 
+export const UNSAFE_WRITE_COMMAND_PATTERNS: RegExp[] = [
+	/^\s*tee\b/,
+	/\|\s*tee\b/,
+	/<<[-]?\s*['"]?\w+['"]?/,
+	/\b(python|python3|node|ruby|perl|php)\b[\s\S]*\b(writeFile|writeFileSync|write_text|open\s*\([^)]*,\s*['"][wa+]|File\.write|fs\.write|createWriteStream)\b/,
+];
+
 function hasUnsafePipe(command: string): boolean {
 	return UNSAFE_PIPE_PATTERNS.some((p) => p.test(command));
 }
@@ -71,8 +82,53 @@ export function isWhitelisted(command: string): boolean {
 	const trimmed = command.trim().replace(/\\\n\s*/g, "").replace(/\n\s*/g, " ");
 	if (UNSAFE_SHELL_CHARS.test(trimmed)) return false;
 	if (REDIRECT_PATTERN.test(trimmed)) return false;
+	if (UNSAFE_WRITE_COMMAND_PATTERNS.some((p) => p.test(trimmed))) return false;
 	if (hasUnsafePipe(trimmed)) return false;
 	return SAFE_COMMAND_PATTERNS.some((p) => p.test(trimmed));
+}
+
+export function getPlanStorageRoot(ctx: ExtensionContext): string {
+	const configured = process.env.DEFAULT_PLAN_STORAGE || (ctx as any).defaultPlanStorage;
+	return path.resolve(configured || path.join(ctx.cwd, "tmp"));
+}
+
+function safeTimestamp(): string {
+	return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+export async function resolvePlanPath(storageRoot: string, requestedPath?: string): Promise<string> {
+	if (requestedPath?.includes("..")) {
+		throw new Error("Plan path must not contain '..' traversal segments.");
+	}
+
+	const filename = requestedPath || `plan-${safeTimestamp()}.md`;
+	if (!/\.mdx?$/i.test(filename)) {
+		throw new Error("Plan files must use a .md or .mdx extension.");
+	}
+
+	const root = path.resolve(storageRoot);
+	const target = path.resolve(root, filename);
+	const relative = path.relative(root, target);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) {
+		throw new Error("Plan path must stay inside the plan storage root.");
+	}
+
+	await fs.mkdir(root, { recursive: true });
+	await fs.mkdir(path.dirname(target), { recursive: true });
+
+	const realRoot = await fs.realpath(root);
+	let realParent: string;
+	try {
+		realParent = await fs.realpath(path.dirname(target));
+	} catch {
+		realParent = path.dirname(target);
+	}
+	const realRelative = path.relative(realRoot, realParent);
+	if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
+		throw new Error("Plan path must not escape storage through symlinks.");
+	}
+
+	return target;
 }
 
 function getBashOverride(entries: any[], command: string): boolean {
@@ -86,6 +142,25 @@ function getBashOverride(entries: any[], command: string): boolean {
 
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
+
+	pi.registerTool({
+		name: "save_plan",
+		label: "Save Plan",
+		description: "Save a Markdown plan file while plan mode is active. Files are constrained to the configured plan storage directory.",
+		parameters: Type.Object({
+			content: Type.String({ description: "Markdown plan content to save" }),
+			path: Type.Optional(Type.String({ description: "Optional relative .md/.mdx path under the plan storage directory" })),
+		}) as any,
+		async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
+			const storageRoot = getPlanStorageRoot(ctx);
+			const target = await resolvePlanPath(storageRoot, params.path);
+			await fs.writeFile(target, params.content, "utf8");
+			return {
+				content: [{ type: "text", text: `Plan saved to ${target}` }],
+				details: { path: target, storageRoot },
+			};
+		},
+	});
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (planModeEnabled) {
@@ -120,8 +195,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (planModeEnabled) {
-			// Hide write/edit tools entirely from the agent
-			pi.setActiveTools(["read", "bash"]);
+			// Hide write/edit tools entirely from the agent; save_plan is the only write path.
+			pi.setActiveTools(["read", "bash", "save_plan"]);
 		} else {
 			// Restore all tools
 			const allTools = pi.getAllTools().map((t) => t.name);
@@ -137,8 +212,9 @@ You are in plan mode. This is a PLANNING PHASE only.
 Available tools:
 - read: Read files to understand the codebase
 - bash: Run commands for exploration (safe commands allowed, others reviewed)
+- save_plan: Save Markdown plans under the configured plan storage directory
 
-Note: write and edit tools are disabled in plan mode.
+Note: write and edit tools are disabled in plan mode. save_plan is the only write-capable tool.
 
 Help the user plan what needs to be done:
 - Explore the codebase
@@ -194,6 +270,13 @@ Help the user plan what needs to be done:
 				return {
 					block: true,
 					reason: "Plan mode: file redirects are not allowed.",
+				};
+			}
+
+			if (UNSAFE_WRITE_COMMAND_PATTERNS.some((p) => p.test(command))) {
+				return {
+					block: true,
+					reason: "Plan mode: write-like shell commands are not allowed. Use save_plan for Markdown plans.",
 				};
 			}
 
