@@ -4,11 +4,19 @@
  * These tests document the current bugs where safe commands are incorrectly blocked.
  */
 
-import { describe, it, expect, vi } from "vitest";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import planModeExtension, { formatPlanRequest, hasPlanRequest, isWhitelisted, resolvePlanPath } from "./plan-mode.js";
+import planModeExtension, {
+	extractLatestPlan,
+	formatPlanRequest,
+	getPlanStorageRoot,
+	hasPlanRequest,
+	isWhitelisted,
+	resolvePlanPath,
+	timestampedPlanFilename,
+} from "./plan-mode.js";
 
 describe("plan request helpers", () => {
 	it("detects non-whitespace plan requests", () => {
@@ -33,8 +41,8 @@ describe("plan command", () => {
 		let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
 		const pi = {
 			registerTool: vi.fn(),
-			registerCommand: vi.fn((_name, config) => {
-				handler = config.handler;
+			registerCommand: vi.fn((name, config) => {
+				if (name === "plan") handler = config.handler;
 			}),
 			on: vi.fn(),
 			appendEntry: vi.fn(),
@@ -188,6 +196,66 @@ describe("plan-mode whitelist", () => {
 			expect(isWhitelisted("python -c \"from pathlib import Path; Path('x').write_text('y')\"")).toBe(false);
 			expect(isWhitelisted("node -e \"require('fs').writeFileSync('x','y')\"")).toBe(false);
 		});
+	});
+});
+
+describe("plan extraction", () => {
+	it("extracts the latest assistant plan from a Plan heading", () => {
+		const plan = extractLatestPlan([
+			{ role: "assistant", content: [{ type: "text", text: "Intro\n\n## Plan\n- Do thing\n\n## Notes\nOther" }] },
+		]);
+
+		expect(plan).toBe("- Do thing");
+	});
+
+	it("falls back to the full latest assistant text", () => {
+		expect(extractLatestPlan([{ role: "assistant", content: "No heading here" }])).toBe("No heading here");
+	});
+});
+
+describe("plan storage resolution", () => {
+	const originalEnv = process.env.DEFAULT_PLAN_STORAGE;
+	afterEach(() => {
+		if (originalEnv === undefined) delete process.env.DEFAULT_PLAN_STORAGE;
+		else process.env.DEFAULT_PLAN_STORAGE = originalEnv;
+	});
+
+	it("uses DEFAULT_PLAN_STORAGE before config files", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			process.env.DEFAULT_PLAN_STORAGE = "env-plans";
+			expect(getPlanStorageRoot({ cwd } as any)).toBe(path.join(cwd, "env-plans"));
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("uses project config and resolves relative paths against cwd", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			delete process.env.DEFAULT_PLAN_STORAGE;
+			await mkdir(path.join(cwd, ".pi"), { recursive: true });
+			await writeFile(path.join(cwd, ".pi", "plan-mode.json"), JSON.stringify({ defaultPlanStorage: "plans" }));
+			expect(getPlanStorageRoot({ cwd } as any)).toBe(path.join(cwd, "plans"));
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("defaults to cwd tmp storage", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "pi-plan-cwd-"));
+		try {
+			delete process.env.DEFAULT_PLAN_STORAGE;
+			expect(getPlanStorageRoot({ cwd } as any)).toBe(path.join(cwd, "tmp"));
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("sanitizes timestamped filenames", () => {
+		const filename = timestampedPlanFilename(new Date("2026-05-03T12:34:56.789Z"));
+		expect(filename).toBe("plan-2026-05-03T12-34-56-789Z.md");
+		expect(path.basename(filename, ".md")).not.toMatch(/[:.]/);
 	});
 });
 

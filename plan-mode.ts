@@ -5,10 +5,11 @@
  * Smart bash filtering with whitelist and AI review.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { completeSimple } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
-import { promises as fs } from "node:fs";
+import { existsSync, readFileSync, promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export const SAFE_COMMAND_PATTERNS: RegExp[] = [
@@ -87,13 +88,35 @@ export function isWhitelisted(command: string): boolean {
 	return SAFE_COMMAND_PATTERNS.some((p) => p.test(trimmed));
 }
 
-export function getPlanStorageRoot(ctx: ExtensionContext): string {
-	const configured = process.env.DEFAULT_PLAN_STORAGE || (ctx as any).defaultPlanStorage;
-	return path.resolve(configured || path.join(ctx.cwd, "tmp"));
+export interface PlanModeConfig {
+	defaultPlanStorage?: string;
 }
 
-function safeTimestamp(): string {
-	return new Date().toISOString().replace(/[:.]/g, "-");
+function readConfig(file: string): PlanModeConfig {
+	if (!existsSync(file)) return {};
+	try {
+		return JSON.parse(readFileSync(file, "utf8")) as PlanModeConfig;
+	} catch {
+		return {};
+	}
+}
+
+export function getPlanStorageRoot(ctx: Pick<ExtensionContext, "cwd">): string {
+	const globalConfig = readConfig(path.join(os.homedir(), ".pi", "agent", "plan-mode.json"));
+	const projectConfig = readConfig(path.join(ctx.cwd, ".pi", "plan-mode.json"));
+	const configured = process.env.DEFAULT_PLAN_STORAGE
+		|| projectConfig.defaultPlanStorage
+		|| globalConfig.defaultPlanStorage
+		|| path.join(ctx.cwd, "tmp");
+	return path.resolve(ctx.cwd, configured);
+}
+
+export function safeTimestamp(date = new Date()): string {
+	return date.toISOString().replace(/[:.]/g, "-");
+}
+
+export function timestampedPlanFilename(date = new Date()): string {
+	return `plan-${safeTimestamp(date)}.md`;
 }
 
 export async function resolvePlanPath(storageRoot: string, requestedPath?: string): Promise<string> {
@@ -101,7 +124,7 @@ export async function resolvePlanPath(storageRoot: string, requestedPath?: strin
 		throw new Error("Plan path must not contain '..' traversal segments.");
 	}
 
-	const filename = requestedPath || `plan-${safeTimestamp()}.md`;
+	const filename = requestedPath || timestampedPlanFilename();
 	if (!/\.mdx?$/i.test(filename)) {
 		throw new Error("Plan files must use a .md or .mdx extension.");
 	}
@@ -153,8 +176,42 @@ ${request}
 Explore as needed, identify files to change, and produce a concrete implementation plan. Use save_plan if the plan should be stored. Do not implement changes until plan mode is exited.`;
 }
 
+function textFromMessage(message: any): string {
+	const content = message?.content;
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content
+			.filter((part) => part?.type === "text" && typeof part.text === "string")
+			.map((part) => part.text)
+			.join("\n");
+	}
+	return "";
+}
+
+export function extractPlanFromText(text: string): string {
+	const match = text.match(/(?:^|\n)#{1,3}\s*(?:Implementation\s+Plan|Plan)\s*\n([\s\S]*?)(?=\n#{1,3}\s+\S|$)/i);
+	const plan = (match?.[1] || text).trim();
+	return plan;
+}
+
+export function extractLatestPlan(messages: any[]): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role !== "assistant") continue;
+		const text = textFromMessage(message).trim();
+		if (!text) continue;
+		return extractPlanFromText(text);
+	}
+	return undefined;
+}
+
+export function formatImplementationPrompt(plan: string): string {
+	return `Implement this plan:\n\n${plan}`;
+}
+
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
+	let pendingNewConversationPlan: string | undefined;
 
 	pi.registerTool({
 		name: "save_plan",
@@ -190,8 +247,14 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	function restoreNormalTools(): void {
+		const allTools = pi.getAllTools?.().map((t) => t.name) || [];
+		if (allTools.length > 0) pi.setActiveTools(allTools);
+	}
+
 	function setPlanMode(enabled: boolean, ctx: ExtensionContext, notify = true): void {
 		planModeEnabled = enabled;
+		if (!planModeEnabled) restoreNormalTools();
 
 		if (notify) {
 			if (planModeEnabled) {
@@ -223,6 +286,50 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 			await (pi as any).sendUserMessage(formatPlanRequest(args));
 		},
+	});
+
+	pi.registerCommand("plan-implement-new", {
+		description: "Implement the most recently captured plan-mode plan in a new conversation",
+		handler: async (_args, ctx: ExtensionCommandContext) => {
+			if (!pendingNewConversationPlan) {
+				ctx.ui.notify("No pending plan to implement in a new conversation.", "warning");
+				return;
+			}
+			const plan = pendingNewConversationPlan;
+			pendingNewConversationPlan = undefined;
+			setPlanMode(false, ctx, false);
+			await (ctx as any).newSession({
+				withSession: async (newCtx: any) => {
+					await newCtx.sendUserMessage(formatImplementationPrompt(plan));
+				},
+			});
+		},
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (!planModeEnabled || !ctx.hasUI) return;
+		const plan = extractLatestPlan(event.messages);
+		if (!plan) return;
+
+		const choice = await ctx.ui.select("Plan complete — what next?", [
+			"Exit plan mode and implement here",
+			"Implement in a new conversation",
+			"Store plan",
+			"Stay in plan mode",
+		]);
+
+		if (choice === "Exit plan mode and implement here") {
+			setPlanMode(false, ctx);
+			await (pi as any).sendUserMessage(formatImplementationPrompt(plan));
+		} else if (choice === "Implement in a new conversation") {
+			pendingNewConversationPlan = plan;
+			ctx.ui.notify("Run /plan-implement-new to start a new conversation with this plan.", "info");
+		} else if (choice === "Store plan") {
+			const storageRoot = getPlanStorageRoot(ctx);
+			const target = await resolvePlanPath(storageRoot);
+			await fs.writeFile(target, plan, "utf8");
+			ctx.ui.notify(`Plan saved to ${target}`, "info");
+		}
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {

@@ -8,6 +8,7 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 - **Prompted planning**: `/plan <request>` enters plan mode and starts a planning turn immediately
 - **Blocks write/edit tools**: When active, `write` and `edit` tools are completely blocked
 - **Controlled plan saving**: `save_plan` is the only write-capable tool in plan mode and only stores Markdown under the plan storage directory
+- **Post-plan action menu**: When a plan finishes, choose whether to implement here, implement in a new conversation, store the plan, or keep planning
 - **Smart bash filtering**: Safe commands allowed, mutating commands reviewed by AI
 - **Git command protection**: Mutating git commands (`commit`, `push`, `pull`, `merge`, etc.) are blocked
 - **Status indicator**: Shows "⚠️ planning" in the UI when active
@@ -19,7 +20,7 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 1. Enable plan mode: `/plan`
 2. Or enter plan mode and start planning immediately: `/plan how to update this extension`
 3. Explore the codebase with read-only tools
-4. Disable plan mode: `/plan` again
+4. When the plan completes, choose an action from the post-plan menu, or disable plan mode manually with `/plan`
 
 ## Command Reference
 
@@ -27,6 +28,35 @@ Plan mode extension for [pi](https://github.com/badlogic/pi): a toggleable read-
 |---|---|
 | `/plan` | Toggle plan mode on/off |
 | `/plan <request>` | Enable/keep plan mode active and send `<request>` to the agent as a planning-only task |
+| `/plan-implement-new` | Start a new conversation seeded with the most recently captured plan |
+
+## Post-Plan Actions
+
+When an assistant turn ends in plan mode and UI is available, pi-plan-mode captures the latest assistant plan and prompts for the next action:
+
+- **Exit plan mode and implement here**: disables plan mode, restores normal tools, and sends the captured plan back as an implementation request in the current conversation.
+- **Implement in a new conversation**: stores the captured plan as pending state. Run `/plan-implement-new` to create a new session and seed it with the implementation prompt.
+- **Store plan**: writes the captured plan to a timestamped Markdown file under the configured plan storage directory.
+- **Stay in plan mode**: leaves plan mode active.
+
+## Plan Storage Configuration
+
+Plan storage is resolved in this order:
+
+1. `DEFAULT_PLAN_STORAGE` environment variable
+2. `defaultPlanStorage` in `<cwd>/.pi/plan-mode.json`
+3. `defaultPlanStorage` in `~/.pi/agent/plan-mode.json`
+4. `<cwd>/tmp`
+
+Example config:
+
+```json
+{
+  "defaultPlanStorage": "tmp"
+}
+```
+
+Relative paths resolve against the current working directory.
 
 ## Safety & Restrictions
 
